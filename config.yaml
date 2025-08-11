@@ -3,3 +3,7 @@ log_level: info
 
 hosts:
   # example.com: 203.0.113.10
+
+ip_family:
+  # example.com: ipv4
+  # ipv6.example.com: ipv6

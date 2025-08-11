@@ -34,12 +34,19 @@ const (
 )
 
 type logLevel int
+type ipFamily int
 
 const (
 	levelDebug logLevel = iota
 	levelInfo
 	levelWarn
 	levelError
+)
+
+const (
+	familyAny ipFamily = iota
+	familyIPv4
+	familyIPv6
 )
 
 var (
@@ -54,12 +61,21 @@ type closeWriter interface {
 }
 
 type config struct {
-	LogLevel logLevel
-	Hosts    map[string]string
+	LogLevel   logLevel
+	Hosts      map[string]string
+	IPFamilies map[string]ipFamily
 }
 
 type leveledLogger struct {
 	level logLevel
+}
+
+type routeTarget struct {
+	Target          string
+	DialTarget      string
+	Network         string
+	HostsOverridden bool
+	IPFamily        ipFamily
 }
 
 func (l leveledLogger) Debugf(format string, args ...any) {
@@ -143,8 +159,9 @@ func defaultConfig() config {
 		panic(err)
 	}
 	return config{
-		LogLevel: level,
-		Hosts:    map[string]string{},
+		LogLevel:   level,
+		Hosts:      map[string]string{},
+		IPFamilies: map[string]ipFamily{},
 	}
 }
 
@@ -178,7 +195,7 @@ func parseYAMLConfig(data []byte) (config, error) {
 	scanner.Buffer(make([]byte, 1024), 64*1024)
 
 	lineNumber := 0
-	inHosts := false
+	section := ""
 	for scanner.Scan() {
 		lineNumber++
 		line := stripYAMLComment(scanner.Text())
@@ -188,14 +205,23 @@ func parseYAMLConfig(data []byte) (config, error) {
 		}
 
 		indented := strings.HasPrefix(line, " ") || strings.HasPrefix(line, "\t")
-		if inHosts {
+		if section != "" {
 			if indented {
-				if err := parseHostMappingLine(cfg.Hosts, trimmedLine, lineNumber); err != nil {
-					return cfg, err
+				switch section {
+				case "hosts":
+					if err := parseHostMappingLine(cfg.Hosts, trimmedLine, lineNumber); err != nil {
+						return cfg, err
+					}
+				case "ip_family":
+					if err := parseIPFamilyMappingLine(cfg.IPFamilies, trimmedLine, lineNumber); err != nil {
+						return cfg, err
+					}
+				default:
+					return cfg, fmt.Errorf("unsupported configuration section %q on line %d", section, lineNumber)
 				}
 				continue
 			}
-			inHosts = false
+			section = ""
 		}
 		if indented {
 			return cfg, fmt.Errorf("unexpected indentation on line %d", lineNumber)
@@ -220,7 +246,12 @@ func parseYAMLConfig(data []byte) (config, error) {
 			if value != "" {
 				return cfg, fmt.Errorf("%q must be a mapping on line %d", key, lineNumber)
 			}
-			inHosts = true
+			section = "hosts"
+		case "ip_family":
+			if value != "" {
+				return cfg, fmt.Errorf("%q must be a mapping on line %d", key, lineNumber)
+			}
+			section = "ip_family"
 		default:
 			return cfg, fmt.Errorf("unsupported configuration key %q on line %d", key, lineNumber)
 		}
@@ -230,6 +261,9 @@ func parseYAMLConfig(data []byte) (config, error) {
 	}
 
 	if err := scanner.Err(); err != nil {
+		return cfg, err
+	}
+	if err := validateConfig(cfg); err != nil {
 		return cfg, err
 	}
 	return cfg, nil
@@ -257,6 +291,44 @@ func parseHostMappingLine(hosts map[string]string, line string, lineNumber int) 
 	}
 
 	hosts[host] = ip.String()
+	return nil
+}
+
+func parseIPFamilyMappingLine(families map[string]ipFamily, line string, lineNumber int) error {
+	host, value, ok := strings.Cut(line, ":")
+	if !ok {
+		return fmt.Errorf("invalid ip_family mapping on line %d", lineNumber)
+	}
+
+	host, err := normalizeHostName(unquoteYAMLScalar(strings.TrimSpace(host)))
+	if err != nil {
+		return fmt.Errorf("invalid ip_family key on line %d: %w", lineNumber, err)
+	}
+
+	value = unquoteYAMLScalar(strings.TrimSpace(value))
+	if value == "" {
+		return fmt.Errorf("missing ip_family value for %q on line %d", host, lineNumber)
+	}
+
+	family, err := parseIPFamily(value)
+	if err != nil {
+		return fmt.Errorf("invalid ip_family value for %q on line %d: %w", host, lineNumber, err)
+	}
+
+	families[host] = family
+	return nil
+}
+
+func validateConfig(cfg config) error {
+	for host, family := range cfg.IPFamilies {
+		address, ok := cfg.Hosts[host]
+		if !ok {
+			continue
+		}
+		if err := validateAddressFamily(address, family); err != nil {
+			return fmt.Errorf("hosts value for %q conflicts with ip_family: %w", host, err)
+		}
+	}
 	return nil
 }
 
@@ -316,6 +388,39 @@ func parseLogLevel(value string) (logLevel, error) {
 	}
 }
 
+func parseIPFamily(value string) (ipFamily, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "ipv4", "ip4", "4":
+		return familyIPv4, nil
+	case "ipv6", "ip6", "6":
+		return familyIPv6, nil
+	default:
+		return familyAny, fmt.Errorf("supported values are ipv4 and ipv6")
+	}
+}
+
+func (f ipFamily) String() string {
+	switch f {
+	case familyIPv4:
+		return "ipv4"
+	case familyIPv6:
+		return "ipv6"
+	default:
+		return "any"
+	}
+}
+
+func (f ipFamily) network() string {
+	switch f {
+	case familyIPv4:
+		return "tcp4"
+	case familyIPv6:
+		return "tcp6"
+	default:
+		return "tcp"
+	}
+}
+
 func normalizeHostName(host string) (string, error) {
 	host = strings.ToLower(strings.TrimSpace(host))
 	if strings.HasSuffix(host, ".") {
@@ -333,23 +438,77 @@ func normalizeHostName(host string) (string, error) {
 	return host, nil
 }
 
-func resolveTargetAddress(target string, serverName string, hosts map[string]string) (string, bool, error) {
+func normalizeLookupName(serverName string) string {
 	serverName = strings.ToLower(strings.TrimSpace(serverName))
 	if strings.HasSuffix(serverName, ".") {
 		serverName = strings.TrimSuffix(serverName, ".")
 	}
+	return serverName
+}
 
-	address, ok := hosts[serverName]
+func resolveRouteTarget(target string, serverName string, cfg config) (routeTarget, error) {
+	route := routeTarget{
+		Target:     target,
+		DialTarget: target,
+		Network:    "tcp",
+	}
+
+	serverName = normalizeLookupName(serverName)
+	if family, ok := cfg.IPFamilies[serverName]; ok {
+		route.IPFamily = family
+		route.Network = family.network()
+	}
+
+	address, ok := cfg.Hosts[serverName]
 	if !ok {
-		return target, false, nil
+		return route, nil
 	}
 
 	_, port, err := net.SplitHostPort(target)
 	if err != nil {
-		return "", false, err
+		return route, err
+	}
+	if err := validateAddressFamily(address, route.IPFamily); err != nil {
+		return route, err
 	}
 
-	return net.JoinHostPort(address, port), true, nil
+	route.DialTarget = net.JoinHostPort(address, port)
+	route.HostsOverridden = true
+	return route, nil
+}
+
+func validateAddressFamily(address string, family ipFamily) error {
+	if family == familyAny {
+		return nil
+	}
+
+	ip, err := netip.ParseAddr(address)
+	if err != nil {
+		return err
+	}
+	if family == familyIPv4 && !ip.Is4() {
+		return fmt.Errorf("address %s is not ipv4", address)
+	}
+	if family == familyIPv6 && !ip.Is6() {
+		return fmt.Errorf("address %s is not ipv6", address)
+	}
+	return nil
+}
+
+func logRoute(protocol string, clientAddr net.Addr, route routeTarget) {
+	if route.HostsOverridden && route.IPFamily != familyAny {
+		appLog.Debugf("%s request from %s is routed to %s via hosts target %s using %s", protocol, clientAddr, route.Target, route.DialTarget, route.IPFamily)
+		return
+	}
+	if route.HostsOverridden {
+		appLog.Debugf("%s request from %s is routed to %s via hosts target %s", protocol, clientAddr, route.Target, route.DialTarget)
+		return
+	}
+	if route.IPFamily != familyAny {
+		appLog.Debugf("%s request from %s is routed to %s using %s", protocol, clientAddr, route.Target, route.IPFamily)
+		return
+	}
+	appLog.Debugf("%s request from %s is routed to %s", protocol, clientAddr, route.Target)
 }
 
 func serve(
@@ -402,18 +561,14 @@ func handleHTTPConnection(client net.Conn, dialTimeout time.Duration, readTimeou
 		return
 	}
 
-	connectTarget, overridden, err := resolveTargetAddress(target, serverName, appConfig.Hosts)
+	route, err := resolveRouteTarget(target, serverName, appConfig)
 	if err != nil {
 		appLog.Errorf("Failed to resolve HTTP target %s from %s: %v", target, client.RemoteAddr(), err)
 		return
 	}
 
-	if overridden {
-		appLog.Debugf("HTTP request from %s is routed to %s via hosts target %s", client.RemoteAddr(), target, connectTarget)
-	} else {
-		appLog.Debugf("HTTP request from %s is routed to %s", client.RemoteAddr(), target)
-	}
-	proxyConnection(client, connectTarget, initial, serverName, dialTimeout)
+	logRoute("HTTP", client.RemoteAddr(), route)
+	proxyConnection(client, route.Network, route.DialTarget, initial, serverName, dialTimeout)
 }
 
 func handleHTTPSConnection(client net.Conn, dialTimeout time.Duration, readTimeout time.Duration) {
@@ -436,24 +591,20 @@ func handleHTTPSConnection(client net.Conn, dialTimeout time.Duration, readTimeo
 	}
 
 	target := net.JoinHostPort(serverName, defaultHTTPSPort)
-	connectTarget, overridden, err := resolveTargetAddress(target, serverName, appConfig.Hosts)
+	route, err := resolveRouteTarget(target, serverName, appConfig)
 	if err != nil {
 		appLog.Errorf("Failed to resolve HTTPS target %s from %s: %v", target, client.RemoteAddr(), err)
 		return
 	}
 
-	if overridden {
-		appLog.Debugf("HTTPS request from %s is routed to %s via hosts target %s", client.RemoteAddr(), target, connectTarget)
-	} else {
-		appLog.Debugf("HTTPS request from %s is routed to %s", client.RemoteAddr(), target)
-	}
-	proxyConnection(client, connectTarget, initial, serverName, dialTimeout)
+	logRoute("HTTPS", client.RemoteAddr(), route)
+	proxyConnection(client, route.Network, route.DialTarget, initial, serverName, dialTimeout)
 }
 
-func proxyConnection(client net.Conn, target string, initial []byte, serverName string, dialTimeout time.Duration) {
-	upstream, err := net.DialTimeout("tcp", target, dialTimeout)
+func proxyConnection(client net.Conn, network string, target string, initial []byte, serverName string, dialTimeout time.Duration) {
+	upstream, err := net.DialTimeout(network, target, dialTimeout)
 	if err != nil {
-		appLog.Errorf("Failed to connect to upstream %s for %s: %v", target, serverName, err)
+		appLog.Errorf("Failed to connect to upstream %s over %s for %s: %v", target, network, serverName, err)
 		return
 	}
 	defer upstream.Close()
