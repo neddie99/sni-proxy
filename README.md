@@ -47,7 +47,9 @@ ip_family:
 
 outbound_ip:
   example.com: 198.51.100.20
+  pool.example.com: 198.51.100.20/24
   ipv6.example.com: "2001:db8::20"
+  ipv6-pool.example.com: "2001:db8::20/64"
 ```
 
 Supported `log_level` values are `debug`, `info`, `warn`, and `error`. Per-request routing logs are printed only when `log_level` is `debug`.
@@ -56,7 +58,9 @@ The optional `hosts` map works like a small per-proxy hosts file. Keys are domai
 
 The optional `ip_family` map forces matching domains to use IPv4 or IPv6. Supported values are `ipv4` and `ipv6`. When used without a `hosts` entry, the proxy dials with `tcp4` or `tcp6`, which constrains DNS resolution to that address family. When used with `hosts`, the configured IP address must match the forced family.
 
-The optional `outbound_ip` map binds matching upstream connections to a specific local source IP address. This only affects outbound connections to upstream servers; the proxy still listens on all configured listen addresses. If `outbound_ip` is used with `ip_family` or `hosts`, all configured addresses for that domain must use the same IP family.
+The optional `outbound_ip` map binds matching upstream connections to a specific local source IP address. Values can be a single IP address or a CIDR prefix. When a CIDR prefix is configured, the proxy picks a random source IP from that prefix for each upstream connection. For IPv4 prefixes larger than `/31`, network and broadcast addresses are skipped. This only affects outbound connections to upstream servers; the proxy still listens on all configured listen addresses. If `outbound_ip` is used with `ip_family` or `hosts`, all configured addresses for that domain must use the same IP family.
+
+The selected outbound IP must be usable by the operating system. On Linux, that usually means the address is assigned to the host, or the system is configured to allow non-local source binding.
 
 ## Flags
 

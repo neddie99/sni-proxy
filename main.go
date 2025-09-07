@@ -3,12 +3,14 @@ package main
 import (
 	"bufio"
 	"bytes"
+	cryptorand "crypto/rand"
 	"encoding/binary"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"math/big"
 	"net"
 	"net/netip"
 	"net/url"
@@ -64,7 +66,7 @@ type config struct {
 	LogLevel   logLevel
 	Hosts      map[string]string
 	IPFamilies map[string]ipFamily
-	OutboundIP map[string]string
+	OutboundIP map[string]outboundSource
 }
 
 type leveledLogger struct {
@@ -78,6 +80,12 @@ type routeTarget struct {
 	HostsOverridden bool
 	IPFamily        ipFamily
 	OutboundIP      string
+}
+
+type outboundSource struct {
+	Value  string
+	Prefix netip.Prefix
+	Family ipFamily
 }
 
 func (l leveledLogger) Debugf(format string, args ...any) {
@@ -164,7 +172,7 @@ func defaultConfig() config {
 		LogLevel:   level,
 		Hosts:      map[string]string{},
 		IPFamilies: map[string]ipFamily{},
-		OutboundIP: map[string]string{},
+		OutboundIP: map[string]outboundSource{},
 	}
 }
 
@@ -331,7 +339,7 @@ func parseIPFamilyMappingLine(families map[string]ipFamily, line string, lineNum
 	return nil
 }
 
-func parseOutboundIPMappingLine(outboundIP map[string]string, line string, lineNumber int) error {
+func parseOutboundIPMappingLine(outboundIP map[string]outboundSource, line string, lineNumber int) error {
 	host, address, ok := strings.Cut(line, ":")
 	if !ok {
 		return fmt.Errorf("invalid outbound_ip mapping on line %d", lineNumber)
@@ -347,12 +355,12 @@ func parseOutboundIPMappingLine(outboundIP map[string]string, line string, lineN
 		return fmt.Errorf("missing outbound_ip value for %q on line %d", host, lineNumber)
 	}
 
-	ip, err := netip.ParseAddr(address)
+	source, err := parseOutboundSource(address)
 	if err != nil {
-		return fmt.Errorf("invalid outbound_ip value for %q on line %d: must be an IP address", host, lineNumber)
+		return fmt.Errorf("invalid outbound_ip value for %q on line %d: %w", host, lineNumber, err)
 	}
 
-	outboundIP[host] = ip.String()
+	outboundIP[host] = source
 	return nil
 }
 
@@ -366,22 +374,53 @@ func validateConfig(cfg config) error {
 			return fmt.Errorf("hosts value for %q conflicts with ip_family: %w", host, err)
 		}
 	}
-	for host, sourceIP := range cfg.OutboundIP {
-		sourceFamily, err := addressFamily(sourceIP)
-		if err != nil {
-			return fmt.Errorf("outbound_ip value for %q is invalid: %w", host, err)
-		}
-
-		if family, ok := cfg.IPFamilies[host]; ok && family != sourceFamily {
-			return fmt.Errorf("outbound_ip value for %q conflicts with ip_family: address %s is not %s", host, sourceIP, family)
+	for host, source := range cfg.OutboundIP {
+		if family, ok := cfg.IPFamilies[host]; ok && family != source.Family {
+			return fmt.Errorf("outbound_ip value for %q conflicts with ip_family: source %s is not %s", host, source.Value, family)
 		}
 		if address, ok := cfg.Hosts[host]; ok {
-			if err := validateAddressFamily(address, sourceFamily); err != nil {
+			if err := validateAddressFamily(address, source.Family); err != nil {
 				return fmt.Errorf("hosts value for %q conflicts with outbound_ip: %w", host, err)
 			}
 		}
 	}
 	return nil
+}
+
+func parseOutboundSource(value string) (outboundSource, error) {
+	if strings.Contains(value, "/") {
+		prefix, err := netip.ParsePrefix(value)
+		if err != nil {
+			return outboundSource{}, fmt.Errorf("must be an IP address or CIDR prefix")
+		}
+
+		prefix = prefix.Masked()
+		family, err := addressFamily(prefix.Addr().String())
+		if err != nil {
+			return outboundSource{}, err
+		}
+		return outboundSource{
+			Value:  prefix.String(),
+			Prefix: prefix,
+			Family: family,
+		}, nil
+	}
+
+	ip, err := netip.ParseAddr(value)
+	if err != nil {
+		return outboundSource{}, fmt.Errorf("must be an IP address or CIDR prefix")
+	}
+
+	family, err := addressFamily(ip.String())
+	if err != nil {
+		return outboundSource{}, err
+	}
+
+	return outboundSource{
+		Value:  ip.String(),
+		Prefix: netip.PrefixFrom(ip, ip.BitLen()),
+		Family: family,
+	}, nil
 }
 
 func stripYAMLComment(line string) string {
@@ -510,17 +549,17 @@ func resolveRouteTarget(target string, serverName string, cfg config) (routeTarg
 		route.IPFamily = family
 		route.Network = family.network()
 	}
-	if sourceIP, ok := cfg.OutboundIP[serverName]; ok {
-		sourceFamily, err := addressFamily(sourceIP)
+	if source, ok := cfg.OutboundIP[serverName]; ok {
+		sourceIP, err := source.RandomIP()
 		if err != nil {
 			return route, err
 		}
-		if route.IPFamily != familyAny && route.IPFamily != sourceFamily {
+		if route.IPFamily != familyAny && route.IPFamily != source.Family {
 			return route, fmt.Errorf("outbound IP %s does not match forced %s family", sourceIP, route.IPFamily)
 		}
 		if route.IPFamily == familyAny {
-			route.IPFamily = sourceFamily
-			route.Network = sourceFamily.network()
+			route.IPFamily = source.Family
+			route.Network = source.Family.network()
 		}
 		route.OutboundIP = sourceIP
 	}
@@ -541,6 +580,14 @@ func resolveRouteTarget(target string, serverName string, cfg config) (routeTarg
 	route.DialTarget = net.JoinHostPort(address, port)
 	route.HostsOverridden = true
 	return route, nil
+}
+
+func (s outboundSource) RandomIP() (string, error) {
+	addr, err := randomAddressFromPrefix(s.Prefix)
+	if err != nil {
+		return "", err
+	}
+	return addr.String(), nil
 }
 
 func addressFamily(address string) (ipFamily, error) {
@@ -573,6 +620,70 @@ func validateAddressFamily(address string, family ipFamily) error {
 		return fmt.Errorf("address %s is not ipv6", address)
 	}
 	return nil
+}
+
+func randomAddressFromPrefix(prefix netip.Prefix) (netip.Addr, error) {
+	if !prefix.IsValid() {
+		return netip.Addr{}, errors.New("prefix is invalid")
+	}
+
+	addr := prefix.Masked().Addr()
+	bitLen := addr.BitLen()
+	hostBits := bitLen - prefix.Bits()
+	if hostBits < 0 {
+		return netip.Addr{}, fmt.Errorf("prefix length is invalid: %s", prefix)
+	}
+
+	size := new(big.Int).Lsh(big.NewInt(1), uint(hostBits))
+	offset := new(big.Int)
+
+	if addr.Is4() && hostBits >= 2 {
+		usableSize := new(big.Int).Sub(size, big.NewInt(2))
+		n, err := cryptorand.Int(cryptorand.Reader, usableSize)
+		if err != nil {
+			return netip.Addr{}, err
+		}
+		offset.Add(n, big.NewInt(1))
+	} else {
+		n, err := cryptorand.Int(cryptorand.Reader, size)
+		if err != nil {
+			return netip.Addr{}, err
+		}
+		offset = n
+	}
+
+	return addAddressOffset(addr, offset)
+}
+
+func addAddressOffset(addr netip.Addr, offset *big.Int) (netip.Addr, error) {
+	var addrBytes []byte
+	if addr.Is4() {
+		a := addr.As4()
+		addrBytes = a[:]
+	} else {
+		a := addr.As16()
+		addrBytes = a[:]
+	}
+
+	base := new(big.Int).SetBytes(addrBytes)
+	base.Add(base, offset)
+	result := base.Bytes()
+	if len(result) > len(addrBytes) {
+		return netip.Addr{}, fmt.Errorf("address offset is out of range for %s", addr)
+	}
+
+	padded := make([]byte, len(addrBytes))
+	copy(padded[len(padded)-len(result):], result)
+
+	if addr.Is4() {
+		var a [4]byte
+		copy(a[:], padded)
+		return netip.AddrFrom4(a), nil
+	}
+
+	var a [16]byte
+	copy(a[:], padded)
+	return netip.AddrFrom16(a), nil
 }
 
 func logRoute(protocol string, clientAddr net.Addr, route routeTarget) {

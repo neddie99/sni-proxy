@@ -10,4 +10,6 @@ ip_family:
 
 outbound_ip:
   # example.com: 198.51.100.20
+  # pool.example.com: 198.51.100.20/24
   # ipv6.example.com: 2001:db8::20
+  # ipv6-pool.example.com: 2001:db8::20/64
