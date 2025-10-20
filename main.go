@@ -63,10 +63,11 @@ type closeWriter interface {
 }
 
 type config struct {
-	LogLevel   logLevel
-	Hosts      map[string]string
-	IPFamilies map[string]ipFamily
-	OutboundIP map[string]outboundSource
+	LogLevel        logLevel
+	ClientWhitelist []netip.Prefix
+	Hosts           map[string]string
+	IPFamilies      map[string]ipFamily
+	OutboundIP      map[string]outboundSource
 }
 
 type leveledLogger struct {
@@ -97,6 +98,12 @@ func (l leveledLogger) Debugf(format string, args ...any) {
 func (l leveledLogger) Infof(format string, args ...any) {
 	if l.level <= levelInfo {
 		log.Printf("INFO "+format, args...)
+	}
+}
+
+func (l leveledLogger) Warnf(format string, args ...any) {
+	if l.level <= levelWarn {
+		log.Printf("WARN "+format, args...)
 	}
 }
 
@@ -169,10 +176,11 @@ func defaultConfig() config {
 		panic(err)
 	}
 	return config{
-		LogLevel:   level,
-		Hosts:      map[string]string{},
-		IPFamilies: map[string]ipFamily{},
-		OutboundIP: map[string]outboundSource{},
+		LogLevel:        level,
+		ClientWhitelist: nil,
+		Hosts:           map[string]string{},
+		IPFamilies:      map[string]ipFamily{},
+		OutboundIP:      map[string]outboundSource{},
 	}
 }
 
@@ -231,6 +239,10 @@ func parseYAMLConfig(data []byte) (config, error) {
 					if err := parseOutboundIPMappingLine(cfg.OutboundIP, trimmedLine, lineNumber); err != nil {
 						return cfg, err
 					}
+				case "client_whitelist":
+					if err := parseClientWhitelistLine(&cfg.ClientWhitelist, trimmedLine, lineNumber); err != nil {
+						return cfg, err
+					}
 				default:
 					return cfg, fmt.Errorf("unsupported configuration section %q on line %d", section, lineNumber)
 				}
@@ -272,6 +284,11 @@ func parseYAMLConfig(data []byte) (config, error) {
 				return cfg, fmt.Errorf("%q must be a mapping on line %d", key, lineNumber)
 			}
 			section = "outbound_ip"
+		case "client_whitelist":
+			if value != "" {
+				return cfg, fmt.Errorf("%q must be a list on line %d", key, lineNumber)
+			}
+			section = "client_whitelist"
 		default:
 			return cfg, fmt.Errorf("unsupported configuration key %q on line %d", key, lineNumber)
 		}
@@ -364,6 +381,25 @@ func parseOutboundIPMappingLine(outboundIP map[string]outboundSource, line strin
 	return nil
 }
 
+func parseClientWhitelistLine(whitelist *[]netip.Prefix, line string, lineNumber int) error {
+	if !strings.HasPrefix(line, "-") {
+		return fmt.Errorf("invalid client_whitelist item on line %d", lineNumber)
+	}
+
+	value := strings.TrimSpace(strings.TrimPrefix(line, "-"))
+	if value == "" {
+		return fmt.Errorf("missing client_whitelist value on line %d", lineNumber)
+	}
+
+	prefix, err := parseIPOrPrefix(unquoteYAMLScalar(value))
+	if err != nil {
+		return fmt.Errorf("invalid client_whitelist value on line %d: %w", lineNumber, err)
+	}
+
+	*whitelist = append(*whitelist, prefix)
+	return nil
+}
+
 func validateConfig(cfg config) error {
 	for host, family := range cfg.IPFamilies {
 		address, ok := cfg.Hosts[host]
@@ -387,14 +423,28 @@ func validateConfig(cfg config) error {
 	return nil
 }
 
-func parseOutboundSource(value string) (outboundSource, error) {
+func parseIPOrPrefix(value string) (netip.Prefix, error) {
 	if strings.Contains(value, "/") {
 		prefix, err := netip.ParsePrefix(value)
 		if err != nil {
-			return outboundSource{}, fmt.Errorf("must be an IP address or CIDR prefix")
+			return netip.Prefix{}, fmt.Errorf("must be an IP address or CIDR prefix")
 		}
+		return prefix.Masked(), nil
+	}
 
-		prefix = prefix.Masked()
+	ip, err := netip.ParseAddr(value)
+	if err != nil {
+		return netip.Prefix{}, fmt.Errorf("must be an IP address or CIDR prefix")
+	}
+	return netip.PrefixFrom(ip, ip.BitLen()), nil
+}
+
+func parseOutboundSource(value string) (outboundSource, error) {
+	if strings.Contains(value, "/") {
+		prefix, err := parseIPOrPrefix(value)
+		if err != nil {
+			return outboundSource{}, err
+		}
 		family, err := addressFamily(prefix.Addr().String())
 		if err != nil {
 			return outboundSource{}, err
@@ -732,9 +782,53 @@ func serve(
 			errCh <- fmt.Errorf("%s accept failed: %w", protocol, err)
 			return
 		}
+		if !clientAllowed(conn.RemoteAddr(), appConfig.ClientWhitelist) {
+			appLog.Warnf("Rejected connection from %s: source IP is not allowed", conn.RemoteAddr())
+			_ = conn.Close()
+			continue
+		}
 
 		go handler(conn, dialTimeout, readTimeout)
 	}
+}
+
+func clientAllowed(remoteAddr net.Addr, whitelist []netip.Prefix) bool {
+	if len(whitelist) == 0 {
+		return true
+	}
+
+	addr, err := remoteAddrIP(remoteAddr)
+	if err != nil {
+		appLog.Warnf("Rejected connection from %s: failed to parse source IP: %v", remoteAddr, err)
+		return false
+	}
+
+	for _, prefix := range whitelist {
+		if prefix.Contains(addr) {
+			return true
+		}
+	}
+	return false
+}
+
+func remoteAddrIP(remoteAddr net.Addr) (netip.Addr, error) {
+	if tcpAddr, ok := remoteAddr.(*net.TCPAddr); ok {
+		addr, ok := netip.AddrFromSlice(tcpAddr.IP)
+		if !ok {
+			return netip.Addr{}, fmt.Errorf("invalid TCP source IP: %s", tcpAddr.IP)
+		}
+		return addr.Unmap(), nil
+	}
+
+	host, _, err := net.SplitHostPort(remoteAddr.String())
+	if err != nil {
+		return netip.Addr{}, err
+	}
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
+		return netip.Addr{}, err
+	}
+	return addr.Unmap(), nil
 }
 
 func handleHTTPConnection(client net.Conn, dialTimeout time.Duration, readTimeout time.Duration) {

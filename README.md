@@ -37,6 +37,11 @@ By default, the proxy reads `config.yaml` from the current working directory. If
 ```yaml
 log_level: info
 
+client_whitelist:
+  - 192.0.2.10
+  - 198.51.100.0/24
+  - "2001:db8::/64"
+
 hosts:
   example.com: 203.0.113.10
   ipv6.example.com: "2001:db8::10"
@@ -53,6 +58,8 @@ outbound_ip:
 ```
 
 Supported `log_level` values are `debug`, `info`, `warn`, and `error`. Per-request routing logs are printed only when `log_level` is `debug`.
+
+The optional `client_whitelist` list restricts which source IP addresses can connect to the proxy. Values can be single IP addresses or CIDR prefixes. When the list is empty or omitted, all clients are allowed. When it is configured, non-matching clients are rejected before HTTP or TLS routing is processed.
 
 The optional `hosts` map works like a small per-proxy hosts file. Keys are domain names, and values must be IP addresses. When a request host or SNI matches a configured domain, the proxy connects directly to that IP address and keeps the original port. For HTTPS, TLS is still passed through unchanged, so the client SNI remains the original domain.
 

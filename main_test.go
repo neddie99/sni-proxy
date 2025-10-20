@@ -78,12 +78,24 @@ func TestReadTLSClientHelloExtractsSNI(t *testing.T) {
 }
 
 func TestParseYAMLConfigReadsLogLevelAndHosts(t *testing.T) {
-	cfg, err := parseYAMLConfig([]byte("# Test configuration\nlog_level: \"debug\" # request logs\nhosts:\n  Example.COM.: 203.0.113.10\n  ipv6.example.com: \"2001:db8::10\"\nip_family:\n  Example.COM.: ipv4\n  ipv6.example.com: ipv6\noutbound_ip:\n  Example.COM.: 198.51.100.20\n  ipv6.example.com: \"2001:db8::20\"\n  range.example.com: 198.51.100.20/24\n"))
+	cfg, err := parseYAMLConfig([]byte("# Test configuration\nlog_level: \"debug\" # request logs\nclient_whitelist:\n  - 192.0.2.10\n  - 198.51.100.0/24\n  - \"2001:db8::/64\"\nhosts:\n  Example.COM.: 203.0.113.10\n  ipv6.example.com: \"2001:db8::10\"\nip_family:\n  Example.COM.: ipv4\n  ipv6.example.com: ipv6\noutbound_ip:\n  Example.COM.: 198.51.100.20\n  ipv6.example.com: \"2001:db8::20\"\n  range.example.com: 198.51.100.20/24\n"))
 	if err != nil {
 		t.Fatalf("parseYAMLConfig returned an error: %v", err)
 	}
 	if cfg.LogLevel != levelDebug {
 		t.Fatalf("LogLevel = %v, want %v", cfg.LogLevel, levelDebug)
+	}
+	if len(cfg.ClientWhitelist) != 3 {
+		t.Fatalf("len(ClientWhitelist) = %d, want %d", len(cfg.ClientWhitelist), 3)
+	}
+	if cfg.ClientWhitelist[0].String() != "192.0.2.10/32" {
+		t.Fatalf("ClientWhitelist[0] = %q, want %q", cfg.ClientWhitelist[0], "192.0.2.10/32")
+	}
+	if cfg.ClientWhitelist[1].String() != "198.51.100.0/24" {
+		t.Fatalf("ClientWhitelist[1] = %q, want %q", cfg.ClientWhitelist[1], "198.51.100.0/24")
+	}
+	if cfg.ClientWhitelist[2].String() != "2001:db8::/64" {
+		t.Fatalf("ClientWhitelist[2] = %q, want %q", cfg.ClientWhitelist[2], "2001:db8::/64")
 	}
 	if cfg.Hosts["example.com"] != "203.0.113.10" {
 		t.Fatalf("Hosts[example.com] = %q, want %q", cfg.Hosts["example.com"], "203.0.113.10")
@@ -155,6 +167,26 @@ func TestParseYAMLConfigRejectsInvalidOutboundIP(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "must be an IP address or CIDR prefix") {
 		t.Fatalf("error = %q, want IP address or CIDR prefix error", err.Error())
+	}
+}
+
+func TestParseYAMLConfigRejectsInvalidClientWhitelistItem(t *testing.T) {
+	_, err := parseYAMLConfig([]byte("client_whitelist:\n  - local.example.net\n"))
+	if err == nil {
+		t.Fatal("parseYAMLConfig returned nil error")
+	}
+	if !strings.Contains(err.Error(), "must be an IP address or CIDR prefix") {
+		t.Fatalf("error = %q, want IP address or CIDR prefix error", err.Error())
+	}
+}
+
+func TestParseYAMLConfigRejectsClientWhitelistMappingItem(t *testing.T) {
+	_, err := parseYAMLConfig([]byte("client_whitelist:\n  192.0.2.10: true\n"))
+	if err == nil {
+		t.Fatal("parseYAMLConfig returned nil error")
+	}
+	if !strings.Contains(err.Error(), "invalid client_whitelist item") {
+		t.Fatalf("error = %q, want invalid item error", err.Error())
 	}
 }
 
@@ -393,6 +425,50 @@ func TestRandomAddressFromIPv4PrefixSkipsNetworkAndBroadcast(t *testing.T) {
 		if !prefix.Contains(addr) {
 			t.Fatalf("addr = %q, want address from %s", addr, prefix)
 		}
+	}
+}
+
+func TestClientAllowedAllowsAllWhenWhitelistIsEmpty(t *testing.T) {
+	remoteAddr := &net.TCPAddr{IP: net.ParseIP("203.0.113.10"), Port: 12345}
+
+	if !clientAllowed(remoteAddr, nil) {
+		t.Fatal("clientAllowed = false, want true")
+	}
+}
+
+func TestClientAllowedMatchesSingleIPv4(t *testing.T) {
+	remoteAddr := &net.TCPAddr{IP: net.ParseIP("192.0.2.10"), Port: 12345}
+	whitelist := []netip.Prefix{netip.MustParsePrefix("192.0.2.10/32")}
+
+	if !clientAllowed(remoteAddr, whitelist) {
+		t.Fatal("clientAllowed = false, want true")
+	}
+}
+
+func TestClientAllowedMatchesIPv4CIDR(t *testing.T) {
+	remoteAddr := &net.TCPAddr{IP: net.ParseIP("198.51.100.42"), Port: 12345}
+	whitelist := []netip.Prefix{netip.MustParsePrefix("198.51.100.0/24")}
+
+	if !clientAllowed(remoteAddr, whitelist) {
+		t.Fatal("clientAllowed = false, want true")
+	}
+}
+
+func TestClientAllowedMatchesIPv6CIDR(t *testing.T) {
+	remoteAddr := &net.TCPAddr{IP: net.ParseIP("2001:db8::42"), Port: 12345}
+	whitelist := []netip.Prefix{netip.MustParsePrefix("2001:db8::/64")}
+
+	if !clientAllowed(remoteAddr, whitelist) {
+		t.Fatal("clientAllowed = false, want true")
+	}
+}
+
+func TestClientAllowedRejectsMissingIP(t *testing.T) {
+	remoteAddr := &net.TCPAddr{IP: net.ParseIP("203.0.113.10"), Port: 12345}
+	whitelist := []netip.Prefix{netip.MustParsePrefix("198.51.100.0/24")}
+
+	if clientAllowed(remoteAddr, whitelist) {
+		t.Fatal("clientAllowed = true, want false")
 	}
 }
 
