@@ -46,19 +46,17 @@ domain_whitelist:
   - example.com
   - ipv6.example.com
 
-hosts:
-  example.com: 203.0.113.10
-  ipv6.example.com: "2001:db8::10"
-
-ip_family:
-  example.com: ipv4
-  ipv6.example.com: ipv6
-
-outbound_ip:
-  example.com: 198.51.100.20
-  pool.example.com: 198.51.100.20/24
-  ipv6.example.com: "2001:db8::20"
-  ipv6-pool.example.com: "2001:db8::20/64"
+routes:
+  example.com:
+    host: 203.0.113.10
+    ip_family: ipv4
+    outbound_ip: 198.51.100.20
+  pool.example.com:
+    outbound_ip: 198.51.100.20/24
+  ipv6.example.com:
+    host: "2001:db8::10"
+    ip_family: ipv6
+    outbound_ip: "2001:db8::20/64"
 ```
 
 Supported `log_level` values are `debug`, `info`, `warn`, and `error`. Per-request routing logs are printed only when `log_level` is `debug`.
@@ -67,11 +65,9 @@ The optional `client_whitelist` list restricts which source IP addresses can con
 
 The optional `domain_whitelist` list restricts which domains can be proxied. Values are exact domain names. When the list is empty or omitted, all domains are allowed. When it is configured, HTTPS requests are allowed only if the SNI is listed; HTTP requests use the `Host` header for the same check.
 
-The optional `hosts` map works like a small per-proxy hosts file. Keys are domain names, and values must be IP addresses. When a request host or SNI matches a configured domain, the proxy connects directly to that IP address and keeps the original port. For HTTPS, TLS is still passed through unchanged, so the client SNI remains the original domain.
+The optional `routes` map keeps per-domain upstream routing settings together. `host` works like a per-proxy hosts entry and must be an IP address. `ip_family` forces matching domains to use `ipv4` or `ipv6`. `outbound_ip` binds upstream connections to a local source IP address, and can be a single IP address or a CIDR prefix. When a CIDR prefix is configured, the proxy picks a random source IP from that prefix for each upstream connection. For IPv4 prefixes larger than `/31`, network and broadcast addresses are skipped. For HTTPS, TLS is still passed through unchanged, so the client SNI remains the original domain.
 
-The optional `ip_family` map forces matching domains to use IPv4 or IPv6. Supported values are `ipv4` and `ipv6`. When used without a `hosts` entry, the proxy dials with `tcp4` or `tcp6`, which constrains DNS resolution to that address family. When used with `hosts`, the configured IP address must match the forced family.
-
-The optional `outbound_ip` map binds matching upstream connections to a specific local source IP address. Values can be a single IP address or a CIDR prefix. When a CIDR prefix is configured, the proxy picks a random source IP from that prefix for each upstream connection. For IPv4 prefixes larger than `/31`, network and broadcast addresses are skipped. This only affects outbound connections to upstream servers; the proxy still listens on all configured listen addresses. If `outbound_ip` is used with `ip_family` or `hosts`, all configured addresses for that domain must use the same IP family.
+The older `hosts`, `ip_family`, and `outbound_ip` top-level maps are still accepted for compatibility. If the same domain appears in `routes`, the `routes` entry takes precedence over those legacy maps.
 
 The selected outbound IP must be usable by the operating system. On Linux, that usually means the address is assigned to the host, or the system is configured to allow non-local source binding.
 

@@ -78,7 +78,7 @@ func TestReadTLSClientHelloExtractsSNI(t *testing.T) {
 }
 
 func TestParseYAMLConfigReadsLogLevelAndHosts(t *testing.T) {
-	cfg, err := parseYAMLConfig([]byte("# Test configuration\nlog_level: \"debug\" # request logs\nclient_whitelist:\n  - 192.0.2.10\n  - 198.51.100.0/24\n  - \"2001:db8::/64\"\ndomain_whitelist:\n  - Example.COM.\n  - ipv6.example.com\nhosts:\n  Example.COM.: 203.0.113.10\n  ipv6.example.com: \"2001:db8::10\"\nip_family:\n  Example.COM.: ipv4\n  ipv6.example.com: ipv6\noutbound_ip:\n  Example.COM.: 198.51.100.20\n  ipv6.example.com: \"2001:db8::20\"\n  range.example.com: 198.51.100.20/24\n"))
+	cfg, err := parseYAMLConfig([]byte("# Test configuration\nlog_level: \"debug\" # request logs\nclient_whitelist:\n  - 192.0.2.10\n  - 198.51.100.0/24\n  - \"2001:db8::/64\"\ndomain_whitelist:\n  - Example.COM.\n  - ipv6.example.com\nroutes:\n  route.example.com:\n    host: 203.0.113.20\n    ip_family: ipv4\n    outbound_ip: 198.51.100.20/30\n  route-ipv6.example.com:\n    host: \"2001:db8::30\"\n    ip_family: ipv6\n    outbound_ip: \"2001:db8::40/126\"\nhosts:\n  Example.COM.: 203.0.113.10\n  ipv6.example.com: \"2001:db8::10\"\nip_family:\n  Example.COM.: ipv4\n  ipv6.example.com: ipv6\noutbound_ip:\n  Example.COM.: 198.51.100.20\n  ipv6.example.com: \"2001:db8::20\"\n  range.example.com: 198.51.100.20/24\n"))
 	if err != nil {
 		t.Fatalf("parseYAMLConfig returned an error: %v", err)
 	}
@@ -102,6 +102,18 @@ func TestParseYAMLConfigReadsLogLevelAndHosts(t *testing.T) {
 	}
 	if _, ok := cfg.DomainWhitelist["ipv6.example.com"]; !ok {
 		t.Fatal("DomainWhitelist[ipv6.example.com] is missing")
+	}
+	if cfg.Routes["route.example.com"].Host != "203.0.113.20" {
+		t.Fatalf("Routes[route.example.com].Host = %q, want %q", cfg.Routes["route.example.com"].Host, "203.0.113.20")
+	}
+	if !cfg.Routes["route.example.com"].HasIPFamily || cfg.Routes["route.example.com"].IPFamily != familyIPv4 {
+		t.Fatalf("Routes[route.example.com].IPFamily = %v, want %v", cfg.Routes["route.example.com"].IPFamily, familyIPv4)
+	}
+	if !cfg.Routes["route.example.com"].HasOutboundIP || cfg.Routes["route.example.com"].OutboundIP.Value != "198.51.100.20/30" {
+		t.Fatalf("Routes[route.example.com].OutboundIP = %q, want %q", cfg.Routes["route.example.com"].OutboundIP.Value, "198.51.100.20/30")
+	}
+	if cfg.Routes["route-ipv6.example.com"].Host != "2001:db8::30" {
+		t.Fatalf("Routes[route-ipv6.example.com].Host = %q, want %q", cfg.Routes["route-ipv6.example.com"].Host, "2001:db8::30")
 	}
 	if cfg.Hosts["example.com"] != "203.0.113.10" {
 		t.Fatalf("Hosts[example.com] = %q, want %q", cfg.Hosts["example.com"], "203.0.113.10")
@@ -236,6 +248,26 @@ func TestParseYAMLConfigRejectsHostsAndOutboundIPMismatch(t *testing.T) {
 	}
 }
 
+func TestParseYAMLConfigRejectsRouteAndIPFamilyMismatch(t *testing.T) {
+	_, err := parseYAMLConfig([]byte("routes:\n  example.com:\n    host: 203.0.113.10\n    ip_family: ipv6\n"))
+	if err == nil {
+		t.Fatal("parseYAMLConfig returned nil error")
+	}
+	if !strings.Contains(err.Error(), "host conflicts with ip_family") {
+		t.Fatalf("error = %q, want route conflict error", err.Error())
+	}
+}
+
+func TestParseYAMLConfigRejectsInvalidRouteKey(t *testing.T) {
+	_, err := parseYAMLConfig([]byte("routes:\n  example.com:\n    target: 203.0.113.10\n"))
+	if err == nil {
+		t.Fatal("parseYAMLConfig returned nil error")
+	}
+	if !strings.Contains(err.Error(), "unsupported route key") {
+		t.Fatalf("error = %q, want unsupported route key error", err.Error())
+	}
+}
+
 func TestResolveRouteTargetUsesHostOverride(t *testing.T) {
 	route, err := resolveRouteTarget(
 		"example.com:8443",
@@ -257,6 +289,60 @@ func TestResolveRouteTargetUsesHostOverride(t *testing.T) {
 	}
 	if route.Network != "tcp" {
 		t.Fatalf("Network = %q, want %q", route.Network, "tcp")
+	}
+}
+
+func TestResolveRouteTargetUsesConsolidatedRoute(t *testing.T) {
+	route, err := resolveRouteTarget(
+		"route.example.com:8443",
+		"Route.Example.COM.",
+		config{
+			Routes: map[string]domainRoute{
+				"route.example.com": {
+					Host:          "203.0.113.20",
+					IPFamily:      familyIPv4,
+					HasIPFamily:   true,
+					OutboundIP:    mustOutboundSource(t, "198.51.100.20"),
+					HasOutboundIP: true,
+				},
+			},
+		},
+	)
+	if err != nil {
+		t.Fatalf("resolveRouteTarget returned an error: %v", err)
+	}
+	if !route.HostsOverridden {
+		t.Fatal("HostsOverridden = false, want true")
+	}
+	if route.Network != "tcp4" {
+		t.Fatalf("Network = %q, want %q", route.Network, "tcp4")
+	}
+	if route.DialTarget != "203.0.113.20:8443" {
+		t.Fatalf("DialTarget = %q, want %q", route.DialTarget, "203.0.113.20:8443")
+	}
+	if route.OutboundIP != "198.51.100.20" {
+		t.Fatalf("OutboundIP = %q, want %q", route.OutboundIP, "198.51.100.20")
+	}
+}
+
+func TestResolveRouteTargetRoutesOverrideLegacyConfig(t *testing.T) {
+	cfg, err := parseYAMLConfig([]byte("routes:\n  example.com:\n    host: 203.0.113.20\n    ip_family: ipv4\n    outbound_ip: 198.51.100.20\nhosts:\n  example.com: 2001:db8::10\nip_family:\n  example.com: ipv6\noutbound_ip:\n  example.com: 2001:db8::20\n"))
+	if err != nil {
+		t.Fatalf("parseYAMLConfig returned an error: %v", err)
+	}
+
+	route, err := resolveRouteTarget("example.com:443", "example.com", cfg)
+	if err != nil {
+		t.Fatalf("resolveRouteTarget returned an error: %v", err)
+	}
+	if route.Network != "tcp4" {
+		t.Fatalf("Network = %q, want %q", route.Network, "tcp4")
+	}
+	if route.DialTarget != "203.0.113.20:443" {
+		t.Fatalf("DialTarget = %q, want %q", route.DialTarget, "203.0.113.20:443")
+	}
+	if route.OutboundIP != "198.51.100.20" {
+		t.Fatalf("OutboundIP = %q, want %q", route.OutboundIP, "198.51.100.20")
 	}
 }
 

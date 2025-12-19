@@ -10,15 +10,14 @@ domain_whitelist:
   # - example.com
   # - ipv6.example.com
 
-hosts:
-  # example.com: 203.0.113.10
-
-ip_family:
-  # example.com: ipv4
-  # ipv6.example.com: ipv6
-
-outbound_ip:
-  # example.com: 198.51.100.20
-  # pool.example.com: 198.51.100.20/24
-  # ipv6.example.com: 2001:db8::20
-  # ipv6-pool.example.com: 2001:db8::20/64
+routes:
+  # example.com:
+  #   host: 203.0.113.10
+  #   ip_family: ipv4
+  #   outbound_ip: 198.51.100.20
+  # pool.example.com:
+  #   outbound_ip: 198.51.100.20/24
+  # ipv6.example.com:
+  #   host: 2001:db8::10
+  #   ip_family: ipv6
+  #   outbound_ip: 2001:db8::20/64

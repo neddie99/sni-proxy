@@ -66,6 +66,7 @@ type config struct {
 	LogLevel        logLevel
 	ClientWhitelist []netip.Prefix
 	DomainWhitelist map[string]struct{}
+	Routes          map[string]domainRoute
 	Hosts           map[string]string
 	IPFamilies      map[string]ipFamily
 	OutboundIP      map[string]outboundSource
@@ -82,6 +83,14 @@ type routeTarget struct {
 	HostsOverridden bool
 	IPFamily        ipFamily
 	OutboundIP      string
+}
+
+type domainRoute struct {
+	Host          string
+	IPFamily      ipFamily
+	HasIPFamily   bool
+	OutboundIP    outboundSource
+	HasOutboundIP bool
 }
 
 type outboundSource struct {
@@ -180,6 +189,7 @@ func defaultConfig() config {
 		LogLevel:        level,
 		ClientWhitelist: nil,
 		DomainWhitelist: map[string]struct{}{},
+		Routes:          map[string]domainRoute{},
 		Hosts:           map[string]string{},
 		IPFamilies:      map[string]ipFamily{},
 		OutboundIP:      map[string]outboundSource{},
@@ -217,6 +227,8 @@ func parseYAMLConfig(data []byte) (config, error) {
 
 	lineNumber := 0
 	section := ""
+	routeHost := ""
+	routeHostIndent := 0
 	for scanner.Scan() {
 		lineNumber++
 		line := stripYAMLComment(scanner.Text())
@@ -225,9 +237,32 @@ func parseYAMLConfig(data []byte) (config, error) {
 			continue
 		}
 
-		indented := strings.HasPrefix(line, " ") || strings.HasPrefix(line, "\t")
+		indent := indentationWidth(line)
+		indented := indent > 0
 		if section != "" {
-			if indented {
+			if section == "routes" {
+				if indented {
+					if routeHost != "" && indent > routeHostIndent {
+						if err := parseRouteFieldLine(cfg.Routes, routeHost, trimmedLine, lineNumber); err != nil {
+							return cfg, err
+						}
+						continue
+					}
+
+					host, err := parseRouteHostLine(trimmedLine, lineNumber)
+					if err != nil {
+						return cfg, err
+					}
+					routeHost = host
+					routeHostIndent = indent
+					if _, ok := cfg.Routes[routeHost]; !ok {
+						cfg.Routes[routeHost] = domainRoute{}
+					}
+					continue
+				}
+				section = ""
+				routeHost = ""
+			} else if indented {
 				switch section {
 				case "hosts":
 					if err := parseHostMappingLine(cfg.Hosts, trimmedLine, lineNumber); err != nil {
@@ -253,8 +288,9 @@ func parseYAMLConfig(data []byte) (config, error) {
 					return cfg, fmt.Errorf("unsupported configuration section %q on line %d", section, lineNumber)
 				}
 				continue
+			} else {
+				section = ""
 			}
-			section = ""
 		}
 		if indented {
 			return cfg, fmt.Errorf("unexpected indentation on line %d", lineNumber)
@@ -300,6 +336,12 @@ func parseYAMLConfig(data []byte) (config, error) {
 				return cfg, fmt.Errorf("%q must be a list on line %d", key, lineNumber)
 			}
 			section = "domain_whitelist"
+		case "routes":
+			if value != "" {
+				return cfg, fmt.Errorf("%q must be a mapping on line %d", key, lineNumber)
+			}
+			section = "routes"
+			routeHost = ""
 		default:
 			return cfg, fmt.Errorf("unsupported configuration key %q on line %d", key, lineNumber)
 		}
@@ -315,6 +357,74 @@ func parseYAMLConfig(data []byte) (config, error) {
 		return cfg, err
 	}
 	return cfg, nil
+}
+
+func indentationWidth(line string) int {
+	width := 0
+	for _, r := range line {
+		if r != ' ' && r != '\t' {
+			return width
+		}
+		width++
+	}
+	return width
+}
+
+func parseRouteHostLine(line string, lineNumber int) (string, error) {
+	host, value, ok := strings.Cut(line, ":")
+	if !ok {
+		return "", fmt.Errorf("invalid routes mapping on line %d", lineNumber)
+	}
+	if strings.TrimSpace(value) != "" {
+		return "", fmt.Errorf("route entry on line %d must be a mapping", lineNumber)
+	}
+
+	host, err := normalizeHostName(unquoteYAMLScalar(strings.TrimSpace(host)))
+	if err != nil {
+		return "", fmt.Errorf("invalid route host on line %d: %w", lineNumber, err)
+	}
+	return host, nil
+}
+
+func parseRouteFieldLine(routes map[string]domainRoute, host string, line string, lineNumber int) error {
+	key, value, ok := strings.Cut(line, ":")
+	if !ok {
+		return fmt.Errorf("invalid route field on line %d", lineNumber)
+	}
+
+	key = strings.TrimSpace(key)
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return fmt.Errorf("missing route value for %q on line %d", key, lineNumber)
+	}
+
+	route := routes[host]
+	var err error
+	switch key {
+	case "host":
+		ip, parseErr := netip.ParseAddr(unquoteYAMLScalar(value))
+		if parseErr != nil {
+			return fmt.Errorf("invalid route host value on line %d: must be an IP address", lineNumber)
+		}
+		route.Host = ip.String()
+	case "ip_family":
+		route.IPFamily, err = parseIPFamily(unquoteYAMLScalar(value))
+		if err != nil {
+			return fmt.Errorf("invalid route ip_family value on line %d: %w", lineNumber, err)
+		}
+		route.HasIPFamily = true
+	case "outbound_ip":
+		route.OutboundIP, err = parseOutboundSource(unquoteYAMLScalar(value))
+		if err != nil {
+			return fmt.Errorf("invalid route outbound_ip value on line %d: %w", lineNumber, err)
+		}
+		route.HasOutboundIP = true
+	default:
+		return fmt.Errorf("unsupported route key %q on line %d", key, lineNumber)
+	}
+
+	routes[host] = route
+	return nil
 }
 
 func parseHostMappingLine(hosts map[string]string, line string, lineNumber int) error {
@@ -436,7 +546,16 @@ func parseYAMLListItem(line string, section string, lineNumber int) (string, err
 }
 
 func validateConfig(cfg config) error {
+	for host, route := range cfg.Routes {
+		if err := validateDomainRoute(host, route); err != nil {
+			return err
+		}
+	}
+
 	for host, family := range cfg.IPFamilies {
+		if _, overridden := cfg.Routes[host]; overridden {
+			continue
+		}
 		address, ok := cfg.Hosts[host]
 		if !ok {
 			continue
@@ -446,6 +565,9 @@ func validateConfig(cfg config) error {
 		}
 	}
 	for host, source := range cfg.OutboundIP {
+		if _, overridden := cfg.Routes[host]; overridden {
+			continue
+		}
 		if family, ok := cfg.IPFamilies[host]; ok && family != source.Family {
 			return fmt.Errorf("outbound_ip value for %q conflicts with ip_family: source %s is not %s", host, source.Value, family)
 		}
@@ -453,6 +575,26 @@ func validateConfig(cfg config) error {
 			if err := validateAddressFamily(address, source.Family); err != nil {
 				return fmt.Errorf("hosts value for %q conflicts with outbound_ip: %w", host, err)
 			}
+		}
+	}
+	return nil
+}
+
+func validateDomainRoute(host string, route domainRoute) error {
+	if route.Host != "" && route.HasIPFamily {
+		if err := validateAddressFamily(route.Host, route.IPFamily); err != nil {
+			return fmt.Errorf("route %q host conflicts with ip_family: %w", host, err)
+		}
+	}
+	if !route.HasOutboundIP {
+		return nil
+	}
+	if route.HasIPFamily && route.IPFamily != route.OutboundIP.Family {
+		return fmt.Errorf("route %q outbound_ip conflicts with ip_family: source %s is not %s", host, route.OutboundIP.Value, route.IPFamily)
+	}
+	if route.Host != "" {
+		if err := validateAddressFamily(route.Host, route.OutboundIP.Family); err != nil {
+			return fmt.Errorf("route %q host conflicts with outbound_ip: %w", host, err)
 		}
 	}
 	return nil
@@ -630,27 +772,51 @@ func resolveRouteTarget(target string, serverName string, cfg config) (routeTarg
 	}
 
 	serverName = normalizeLookupName(serverName)
-	if family, ok := cfg.IPFamilies[serverName]; ok {
-		route.IPFamily = family
-		route.Network = family.network()
-	}
-	if source, ok := cfg.OutboundIP[serverName]; ok {
-		sourceIP, err := source.RandomIP()
-		if err != nil {
-			return route, err
+
+	var address string
+	if routeConfig, ok := cfg.Routes[serverName]; ok {
+		if routeConfig.HasIPFamily {
+			route.IPFamily = routeConfig.IPFamily
+			route.Network = routeConfig.IPFamily.network()
 		}
-		if route.IPFamily != familyAny && route.IPFamily != source.Family {
-			return route, fmt.Errorf("outbound IP %s does not match forced %s family", sourceIP, route.IPFamily)
+		if routeConfig.HasOutboundIP {
+			sourceIP, err := routeConfig.OutboundIP.RandomIP()
+			if err != nil {
+				return route, err
+			}
+			if route.IPFamily != familyAny && route.IPFamily != routeConfig.OutboundIP.Family {
+				return route, fmt.Errorf("outbound IP %s does not match forced %s family", sourceIP, route.IPFamily)
+			}
+			if route.IPFamily == familyAny {
+				route.IPFamily = routeConfig.OutboundIP.Family
+				route.Network = routeConfig.OutboundIP.Family.network()
+			}
+			route.OutboundIP = sourceIP
 		}
-		if route.IPFamily == familyAny {
-			route.IPFamily = source.Family
-			route.Network = source.Family.network()
+		address = routeConfig.Host
+	} else {
+		if family, ok := cfg.IPFamilies[serverName]; ok {
+			route.IPFamily = family
+			route.Network = family.network()
 		}
-		route.OutboundIP = sourceIP
+		if source, ok := cfg.OutboundIP[serverName]; ok {
+			sourceIP, err := source.RandomIP()
+			if err != nil {
+				return route, err
+			}
+			if route.IPFamily != familyAny && route.IPFamily != source.Family {
+				return route, fmt.Errorf("outbound IP %s does not match forced %s family", sourceIP, route.IPFamily)
+			}
+			if route.IPFamily == familyAny {
+				route.IPFamily = source.Family
+				route.Network = source.Family.network()
+			}
+			route.OutboundIP = sourceIP
+		}
+		address = cfg.Hosts[serverName]
 	}
 
-	address, ok := cfg.Hosts[serverName]
-	if !ok {
+	if address == "" {
 		return route, nil
 	}
 
@@ -773,11 +939,11 @@ func addAddressOffset(addr netip.Addr, offset *big.Int) (netip.Addr, error) {
 
 func logRoute(protocol string, clientAddr net.Addr, route routeTarget) {
 	if route.OutboundIP != "" && route.HostsOverridden && route.IPFamily != familyAny {
-		appLog.Debugf("%s request from %s is routed to %s via hosts target %s using %s from source %s", protocol, clientAddr, route.Target, route.DialTarget, route.IPFamily, route.OutboundIP)
+		appLog.Debugf("%s request from %s is routed to %s via upstream target %s using %s from source %s", protocol, clientAddr, route.Target, route.DialTarget, route.IPFamily, route.OutboundIP)
 		return
 	}
 	if route.OutboundIP != "" && route.HostsOverridden {
-		appLog.Debugf("%s request from %s is routed to %s via hosts target %s from source %s", protocol, clientAddr, route.Target, route.DialTarget, route.OutboundIP)
+		appLog.Debugf("%s request from %s is routed to %s via upstream target %s from source %s", protocol, clientAddr, route.Target, route.DialTarget, route.OutboundIP)
 		return
 	}
 	if route.OutboundIP != "" && route.IPFamily != familyAny {
@@ -789,11 +955,11 @@ func logRoute(protocol string, clientAddr net.Addr, route routeTarget) {
 		return
 	}
 	if route.HostsOverridden && route.IPFamily != familyAny {
-		appLog.Debugf("%s request from %s is routed to %s via hosts target %s using %s", protocol, clientAddr, route.Target, route.DialTarget, route.IPFamily)
+		appLog.Debugf("%s request from %s is routed to %s via upstream target %s using %s", protocol, clientAddr, route.Target, route.DialTarget, route.IPFamily)
 		return
 	}
 	if route.HostsOverridden {
-		appLog.Debugf("%s request from %s is routed to %s via hosts target %s", protocol, clientAddr, route.Target, route.DialTarget)
+		appLog.Debugf("%s request from %s is routed to %s via upstream target %s", protocol, clientAddr, route.Target, route.DialTarget)
 		return
 	}
 	if route.IPFamily != familyAny {
